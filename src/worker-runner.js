@@ -9,21 +9,36 @@ import Tinypool, { workerId } from "tinypool";
 /** @typedef {{ failures: number, passes: number, pending: number, start: number, end: number }} Stats */
 /** @typedef {{ ancestors: string[], title: string, duration: number, errors: Error[], skipped: boolean }} InternalTestResult */
 
-const initialSetup = once(async projectConfig => {
+async function init({ globalConfig, runtime }) {
+  const originalDirectory = process.cwd();
+
+  let result = {
+    globalConfig,
+    runtime,
+    JEST_WORKER_ID: process.env.JEST_WORKER_ID,
+    originalDirectory: originalDirectory,
+    originalCwd: process.cwd,
+    originalChdir: process.chdir,
+  };
+
+  // Setup `JEST_WORKER_ID` environment variable
+  // https://jestjs.io/docs/environment-variables
+  if (runtime === "main_thread") {
+    process.env.JEST_WORKER_ID = "1";
+  } else {
+    process.env.JEST_WORKER_ID = String(workerId);
+  }
+
   // Node.js workers (worker_threads) don't support
   // process.chdir, that we use multiple times in our tests.
   // We can "polyfill" it for process.cwd() usage, but it
   // won't affect path.* and fs.* functions.
-  if (Tinypool.isWorkerThread) {
-    process.env.JEST_WORKER_ID = String(workerId);
-    const startCwd = process.cwd();
-    let cwd = startCwd;
-    process.cwd = () => cwd;
-    process.chdir = dir => {
-      cwd = path.resolve(cwd, dir);
+  if (runtime === "worker_threads") {
+    let current = originalDirectory;
+    process.cwd = () => current;
+    process.chdir = directory => {
+      current = path.resolve(current, directory);
     };
-  } else {
-    process.env.JEST_WORKER_ID = "1";
   }
 
   for (const setupFile of projectConfig.setupFiles) {
@@ -48,15 +63,50 @@ const initialSetup = once(async projectConfig => {
     if (typeof setup === "function") await setup();
   }
 
-  return snapshot.getSerializers().slice();
-});
+  result.globalSnapshotSerializers = snapshot.getSerializers().slice();
 
-export default async function run({ test, updateSnapshot, testNamePattern }) {
-  const projectSnapshotSerializers = await initialSetup(test.context.config);
+  return result;
+}
 
-  const testNamePatternRE =
-    testNamePattern != null ? new RegExp(testNamePattern, "i") : null;
+async function cleanup(state) {
+  // Restore `process.env.JEST_WORKER_ID`
+  const { JEST_WORKER_ID, originalDirectory, originalCwd, originalChdir } =
+    state;
+  if (JEST_WORKER_ID === undefined) {
+    delete process.env.JEST_WORKER_ID;
+  } else {
+    process.env.JEST_WORKER_ID = JEST_WORKER_ID;
+  }
 
+  const currentDirectory = process.cwd();
+
+  if (originalDirectory !== currentDirectory) {
+    process.chdir(originalDirectory);
+  }
+
+  // Restore `process.cwd`
+  if (process.cwd !== originalCwd) {
+    process.cwd = originalCwd;
+  }
+
+  // Restore `process.chdir`
+  if (process.chdir !== originalChdir) {
+    process.chdir = originalChdir;
+  }
+}
+
+let state;
+export default async function run({ action, data }) {
+  if (action === "test") {
+    return runTestFile(data);
+  } else if (action === "init") {
+    state = await init(data);
+  } else if (action === "cleanup") {
+    state = await cleanup(state);
+  }
+}
+
+async function runTestFile(test) {
   /** @type {Stats} */
   const stats = { passes: 0, failures: 0, pending: 0, start: 0, end: 0 };
   /** @type {Array<InternalTestResult>} */
@@ -71,12 +121,15 @@ export default async function run({ test, updateSnapshot, testNamePattern }) {
     snapshotResolver.resolveSnapshotPath(test.path),
     {
       prettierPath: "prettier",
-      updateSnapshot,
+      updateSnapshot: state.globalConfig.updateSnapshot,
       snapshotFormat: test.context.config.snapshotFormat,
     },
   );
   expect.setState({ snapshotState, testPath: test.path });
 
+  const { testNamePattern } = state.globalConfig;
+  const testNamePatternRE =
+    testNamePattern != null ? new RegExp(testNamePattern, "i") : null;
   stats.start = performance.now();
   await runTestBlock(tests, hasFocusedTests, testNamePatternRE, results, stats);
   stats.end = performance.now();
@@ -337,17 +390,6 @@ function failureToString(test) {
       .join("\n") +
     "\n"
   );
-}
-
-function once(fn) {
-  let called = false;
-  let result;
-  return function () {
-    if (called) return result;
-    called = true;
-    result = fn.apply(this, arguments);
-    return result;
-  };
 }
 
 function arrayReplace(array, replacement) {
